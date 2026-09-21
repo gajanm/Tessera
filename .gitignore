@@ -1,0 +1,33 @@
+# secrets
+.env
+.env.*
+!.env.example
+*.key
+*.cert
+*.pem
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# model weights
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# outputs
+outputs/
+*.ply
+
+# node
+node_modules/
+dist/
+.vite/
+
+# os
+.DS_Store
+.vscode/
+.idea/

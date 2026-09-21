@@ -1,0 +1,17 @@
+numpy
+opencv-python
+pillow
+einops
+huggingface_hub
+safetensors
+
+fastapi
+uvicorn[standard]
+websockets
+python-multipart
+
+open3d
+scikit-learn
+
+python-dotenv
+openai
