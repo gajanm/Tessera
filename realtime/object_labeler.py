@@ -108,6 +108,7 @@ class ObjectLabeler:
 
         # Collect raw detections across all frames
         raw_detections: list[dict] = []
+        attempts, failures, first_error = 0, 0, None
 
         for prompt in prompts:
             prompt = prompt.strip()
@@ -115,14 +116,22 @@ class ObjectLabeler:
                 continue
 
             for fdata in frames:
+                attempts += 1
                 try:
                     frame_dets = self._detect_in_frame(
                         fdata, prompt, confidence_threshold, include_debug_images
                     )
                     raw_detections.extend(frame_dets)
                 except Exception as e:
+                    failures += 1
+                    first_error = first_error or e
                     print(f"[ObjectLabeler] Error on frame {fdata.frame_idx} for '{prompt}': {e}")
                     continue
+
+        # One bad frame is fine to skip. Every frame failing is a broken setup,
+        # and reporting it as "0 objects" hides the real cause from the UI.
+        if attempts and failures == attempts:
+            raise RuntimeError(f"SAM3 failed on all {attempts} frames: {first_error}")
 
         if not raw_detections:
             print("[ObjectLabeler] No detections found")
@@ -180,10 +189,16 @@ class ObjectLabeler:
         """
         pil_img = Image.fromarray(fdata.image)
 
-        # Run SAM3 text-prompted segmentation
-        state = self.sam3_processor.set_image(pil_img)
-        self.sam3_processor.set_confidence_threshold(confidence_threshold, state)
-        output = self.sam3_processor.set_text_prompt(state=state, prompt=prompt)
+        # Run SAM3 text-prompted segmentation.
+        # SAM3's decoder forces the FlashAttention backend, which only accepts
+        # fp16/bf16 inputs; in plain fp32 every call dies with "No available
+        # kernel". Meta's own examples run under bf16 autocast, so we do too.
+        # autocast is thread-local, and labeling runs in a background thread,
+        # so it has to be entered here rather than once at startup.
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda"):
+            state = self.sam3_processor.set_image(pil_img)
+            self.sam3_processor.set_confidence_threshold(confidence_threshold, state)
+            output = self.sam3_processor.set_text_prompt(state=state, prompt=prompt)
 
         masks = output.get('masks')
         scores = output.get('scores')
