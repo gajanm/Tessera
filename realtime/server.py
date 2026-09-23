@@ -138,6 +138,32 @@ def _locked_save() -> None:
         pipeline.save_to_disk()
 
 
+# Requests hitting the LLM endpoints. The SDK default is 600s, so without an
+# explicit timeout one stalled connection blocks that request for ten minutes.
+OPENAI_TIMEOUT_S = 20.0
+_openai_client = None
+
+
+def _get_openai():
+    """Process-wide AsyncOpenAI client, or None if no key is configured.
+
+    One client for the process, not one per request: each construction opens a
+    fresh connection pool that is never closed, so every call paid a full TLS
+    handshake and leaked the pool afterwards. Safe without a lock because this
+    never awaits, so it cannot be interleaved on the event loop.
+    """
+    global _openai_client
+    api_key = os.environ.get('OPENAI_API_KEY', '')
+    if not api_key or api_key == 'your-api-key-here':
+        return None
+    if _openai_client is None:
+        from openai import AsyncOpenAI
+        _openai_client = AsyncOpenAI(api_key=api_key,
+                                     timeout=OPENAI_TIMEOUT_S,
+                                     max_retries=2)
+    return _openai_client
+
+
 def _decode_frame(img_b64: str):
     """base64 JPEG -> BGR ndarray. Blocking (CPU), call via to_thread."""
     img_bytes = base64.b64decode(img_b64)
@@ -594,15 +620,12 @@ async def parse_nl_prompt(req: NLParseRequest):
     Use OpenAI to extract comma-separated object names from a
     natural language description.
     """
-    api_key = os.environ.get('OPENAI_API_KEY', '')
-    if not api_key or api_key == 'your-api-key-here':
+    client = _get_openai()
+    if client is None:
         return JSONResponse({"error": "OPENAI_API_KEY not configured in .env"}, status_code=500)
 
     try:
-        from openai import OpenAI
-        client = OpenAI(api_key=api_key)
-
-        response = client.chat.completions.create(
+        response = await client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {
@@ -654,17 +677,14 @@ async def analyze(req: AnalyzeRequest):
     questions people actually ask ("what is left of the desk?", "will the box
     fit on the shelf?") while keeping the prompt small and cheap.
     """
-    api_key = os.environ.get('OPENAI_API_KEY', '')
-    if not api_key or api_key == 'your-api-key-here':
+    client = _get_openai()
+    if client is None:
         return JSONResponse({"error": "OPENAI_API_KEY not configured in .env"}, status_code=500)
 
     if not req.objects:
         return {"answer": "No objects are labeled yet. Run a label pass first, then ask."}
 
     try:
-        from openai import OpenAI
-        client = OpenAI(api_key=api_key)
-
         # Compact, deterministic scene description. Units are world units, and
         # the axes are the viewer's convention (x right, y up, z toward camera).
         lines = []
@@ -702,7 +722,7 @@ async def analyze(req: AnalyzeRequest):
 
         messages.append({"role": "user", "content": req.question})
 
-        response = client.chat.completions.create(
+        response = await client.chat.completions.create(
             model="gpt-4o-mini",
             messages=messages,
             max_tokens=300,
@@ -976,6 +996,16 @@ else:
 # ─────────────────────────────────────────
 # Startup
 # ─────────────────────────────────────────
+@app.on_event("shutdown")
+async def _close_openai():
+    """Release the shared HTTP pool so shutdown is clean."""
+    if _openai_client is not None:
+        try:
+            await _openai_client.close()
+        except Exception:
+            pass
+
+
 @app.on_event("startup")
 async def startup():
     loop = asyncio.get_event_loop()
