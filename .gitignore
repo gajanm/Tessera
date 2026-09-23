@@ -21,6 +21,9 @@ venv/
 # outputs
 outputs/
 *.ply
+saved_cloud.npz
+saved_frames.npz
+*.npz
 
 # node
 node_modules/

@@ -73,3 +73,16 @@ To reach it from a phone (camera access requires HTTPS):
     cloudflared tunnel --url http://localhost:5000
 
 Open the printed URL on your phone for the sender, and on your laptop for the viewer.
+
+Before a demo, `bash preflight.sh` checks everything the demo depends on and
+exits non-zero on the first thing that would break.
+
+## Tests
+
+The Sim3 alignment, the chunk bookkeeping, the binary wire format and the HTTP
+layer are all pure CPU code, so the suite runs on a laptop with no GPU:
+
+    cd realtime && python -m pytest
+
+Model inference and SAM3 are not covered — those need the GPU box, and
+`preflight.sh` plus `debug_labeling.py` are the tools for them.

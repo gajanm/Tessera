@@ -29,7 +29,7 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
 
-from pipeline import IncrementalPi3
+from pipeline import IncrementalPi3, count_available_chunks
 from object_labeler import ObjectLabeler, FrameData
 
 # ─────────────────────────────────────────
@@ -71,14 +71,7 @@ def frames_dropped_total_inc():
 # WebSocket broadcast helper
 # ─────────────────────────────────────────
 async def _fan_out(targets: list[WebSocket], sends) -> None:
-    """Await every send concurrently and drop the sockets that failed.
-
-    Two reasons this is not a plain `for ws in connected_viewers: await ...`:
-    the await yields, so a viewer connecting or disconnecting mid-loop mutates
-    the set we are iterating and raises "Set changed size during iteration",
-    killing the broadcast partway through; and sending serially means one slow
-    viewer delays every viewer queued behind it.
-    """
+    """Send concurrently, drop the sockets that failed."""
     results = await asyncio.gather(*sends, return_exceptions=True)
     dead = {ws for ws, r in zip(targets, results) if isinstance(r, BaseException)}
     if dead:
@@ -102,14 +95,7 @@ async def broadcast_binary(data: bytes):
 
 
 # ─────────────────────────────────────────
-# Blocking pipeline operations
-#
-# Every one of these takes `processing_lock`, which the worker thread holds for
-# the whole duration of a chunk. Acquiring it directly inside an `async def`
-# parks the event loop thread, so a single /configure or /reset froze frame
-# ingest, chunk broadcasts, acks and /health for seconds. Handlers call these
-# through asyncio.to_thread so the wait happens on a worker thread and the loop
-# keeps serving.
+# Blocking pipeline ops — call these via asyncio.to_thread
 # ─────────────────────────────────────────
 def _drain_frame_queue() -> None:
     while not frame_queue.empty():
@@ -138,20 +124,12 @@ def _locked_save() -> None:
         pipeline.save_to_disk()
 
 
-# Requests hitting the LLM endpoints. The SDK default is 600s, so without an
-# explicit timeout one stalled connection blocks that request for ten minutes.
-OPENAI_TIMEOUT_S = 20.0
+OPENAI_TIMEOUT_S = 20.0   # SDK default is 600s
 _openai_client = None
 
 
 def _get_openai():
-    """Process-wide AsyncOpenAI client, or None if no key is configured.
-
-    One client for the process, not one per request: each construction opens a
-    fresh connection pool that is never closed, so every call paid a full TLS
-    handshake and leaked the pool afterwards. Safe without a lock because this
-    never awaits, so it cannot be interleaved on the event loop.
-    """
+    """Shared AsyncOpenAI client, or None if no key is configured."""
     global _openai_client
     api_key = os.environ.get('OPENAI_API_KEY', '')
     if not api_key or api_key == 'your-api-key-here':
@@ -172,11 +150,7 @@ def _decode_frame(img_b64: str):
 
 
 def _encode_current_cloud():
-    """Snapshot and encode the accumulated cloud, or None if empty.
-
-    Concatenating millions of points and packing them is blocking CPU work,
-    so this runs via to_thread rather than inside the WebSocket handler.
-    """
+    """Snapshot and encode the accumulated cloud, or None if empty."""
     if pipeline is None or pipeline.total_points <= 0:
         return None
     cloud = pipeline.get_global_cloud(max_points=100_000)
@@ -298,20 +272,16 @@ def processing_loop(loop: asyncio.AbstractEventLoop):
 
     use_parallel = pipeline.num_workers > 1
     ACCUMULATION_WINDOW = 3.0 if use_parallel else 0.0
-    stride = pipeline.chunk_size - pipeline.overlap
 
     mode_str = (f"parallel ×{pipeline.num_workers}, accum {ACCUMULATION_WINDOW}s"
                 if use_parallel else "sequential")
     print(f"[Server] Processing loop started ({mode_str})")
 
     def _count_available_chunks() -> int:
-        buf = len(pipeline.frame_buffer)
-        if pipeline.is_first_chunk:
-            if buf < pipeline.chunk_size:
-                return 0
-            return 1 + (buf - pipeline.chunk_size) // stride
-        else:
-            return buf // stride
+        # read the config live: /configure can change it mid-run
+        return count_available_chunks(len(pipeline.frame_buffer),
+                                      pipeline.is_first_chunk,
+                                      pipeline.chunk_size, pipeline.overlap)
 
     def _send_status():
         remaining = pipeline.frames_until_ready()
@@ -555,10 +525,6 @@ async def get_config():
 @app.get("/cloud")
 async def get_full_cloud():
     """Get the full accumulated point cloud (downsampled)."""
-    # Concatenating and downsampling the whole cloud is blocking CPU work and
-    # has no business running on the event loop. Note this endpoint discards
-    # the cloud it builds and returns only counts -- left as-is here because
-    # deleting it is a separate decision, but it is an expensive no-op.
     cloud = await asyncio.to_thread(pipeline.get_global_cloud, 200_000)
     pts = cloud['points']
     return JSONResponse({
@@ -573,9 +539,7 @@ async def upload_video(file: UploadFile = File(...), fps: float = 2.0, fast: boo
     """Upload a video file for testing (simulates live camera feed)."""
     video_feeder_stop.clear()
 
-    # Save uploaded file. Streamed in chunks rather than file.read() into one
-    # bytes object, so a large video does not spike memory, and each write goes
-    # to a worker thread so disk I/O never stalls the loop.
+    # Save uploaded file, streamed so a large video does not spike memory
     tmp = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
     tmp_path = tmp.name
     tmp.close()
@@ -679,12 +643,12 @@ async def analyze(req: AnalyzeRequest):
     questions people actually ask ("what is left of the desk?", "will the box
     fit on the shelf?") while keeping the prompt small and cheap.
     """
+    if not req.objects:
+        return {"answer": "No objects are labeled yet. Run a label pass first, then ask."}
+
     client = _get_openai()
     if client is None:
         return JSONResponse({"error": "OPENAI_API_KEY not configured in .env"}, status_code=500)
-
-    if not req.objects:
-        return {"answer": "No objects are labeled yet. Run a label pass first, then ask."}
 
     try:
         # Compact, deterministic scene description. Units are world units, and
@@ -770,19 +734,13 @@ async def label_objects_endpoint(req: LabelRequest):
     if _labeling_in_progress:
         return JSONResponse({"error": "Labeling already in progress"}, status_code=409)
 
-    # Claim the slot here rather than inside the worker. Handlers run on the
-    # single event-loop thread, so this check-and-set cannot be interleaved;
-    # setting it after the thread starts left a window in which a second
-    # request also passed the guard and loaded a second SAM3 onto a GPU that
-    # auto_detect_workers has already sized to be full.
+    # Claim the slot on the loop; setting it inside the worker races.
     _labeling_in_progress = True
 
     # Notify viewers that labeling is starting
     await broadcast_to_viewers({'type': 'labeling_start', 'prompts': prompts})
 
-    # Capture the event loop for broadcasting from the background thread.
-    # get_running_loop, not get_event_loop: inside a coroutine the latter is
-    # deprecated and only happens to work.
+    # Capture the event loop for broadcasting from the background thread
     loop = asyncio.get_running_loop()
 
     # Copy frame_data snapshot so background thread doesn't fight with pipeline
@@ -856,9 +814,7 @@ async def label_objects_endpoint(req: LabelRequest):
         finally:
             _labeling_in_progress = False
 
-    # Fire-and-forget: start background thread, return 202 immediately.
-    # If the thread cannot start, release the slot we claimed above, otherwise
-    # labeling is wedged at "already in progress" until the server restarts.
+    # Fire-and-forget: start background thread, return 202 immediately
     try:
         t = threading.Thread(target=_run_labeling_background, daemon=True)
         t.start()
@@ -949,9 +905,6 @@ async def sender_ws(ws: WebSocket):
             msg = json.loads(data)
 
             if msg.get('type') == 'frame':
-                # base64 + JPEG decode is 5-15ms of CPU per frame; at 10fps that
-                # is a permanent tax on the event loop, stalling every other
-                # connection. Hand it to a worker thread.
                 frame = await asyncio.to_thread(_decode_frame, msg['image'])
 
                 if frame is not None:
@@ -1014,7 +967,7 @@ else:
 # ─────────────────────────────────────────
 @app.on_event("shutdown")
 async def _close_openai():
-    """Release the shared HTTP pool so shutdown is clean."""
+    """Release the shared HTTP pool."""
     if _openai_client is not None:
         try:
             await _openai_client.close()
@@ -1024,9 +977,6 @@ async def _close_openai():
 
 @app.on_event("startup")
 async def startup():
-    # The worker thread hands broadcasts back with run_coroutine_threadsafe, so
-    # it needs the loop that is actually running, not whatever get_event_loop
-    # would resolve to.
     loop = asyncio.get_running_loop()
     t = threading.Thread(target=processing_loop, args=(loop,), daemon=True)
     t.start()

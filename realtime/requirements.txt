@@ -1,6 +1,10 @@
 # --- torch installed separately, see README ---
-numpy
-opencv-python
+
+# preflight.sh enforces these bounds: sam3 needs numpy 1.x, and opencv >= 4.12
+# is built against numpy 2 and segfaults on first array use with numpy 1.x
+numpy<2
+opencv-python<4.12
+
 pillow
 einops
 huggingface_hub
@@ -18,3 +22,10 @@ python-dotenv
 openai
 transformers
 accelerate
+
+# sam3 is not on PyPI; object labeling will not import without it
+sam3 @ git+https://github.com/facebookresearch/sam3.git
+
+# --- dev only ---
+pytest
+httpx          # required by fastapi.testclient

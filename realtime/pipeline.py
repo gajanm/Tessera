@@ -39,6 +39,42 @@ def compute_target_size(w: int, h: int) -> tuple[int, int]:
     return k * PATCH_SIZE, m * PATCH_SIZE
 
 
+def count_available_chunks(buf_len: int, is_first: bool,
+                           chunk_size: int, overlap: int) -> int:
+    """How many chunks the buffered frames can currently form."""
+    stride = chunk_size - overlap
+    if stride <= 0:
+        return 0
+    if is_first:
+        if buf_len < chunk_size:
+            return 0
+        return 1 + (buf_len - chunk_size) // stride
+    if buf_len < stride:
+        return 0
+    return buf_len // stride
+
+
+def plan_chunks(buf_len: int, is_first: bool, chunk_size: int, overlap: int,
+                max_chunks: int) -> list[tuple[int, int]]:
+    """Frame-buffer span [start, end) for each chunk to run this pass.
+
+    A negative start means the chunk begins with that many frames carried over
+    from the previous chunk's tail, so consecutive chunks always share exactly
+    `overlap` frames.
+    """
+    stride = chunk_size - overlap
+    n = min(count_available_chunks(buf_len, is_first, chunk_size, overlap),
+            max_chunks)
+    spans = []
+    for ci in range(max(n, 0)):
+        start = ci * stride if is_first else ci * stride - overlap
+        end = start + chunk_size
+        if end > buf_len:
+            break
+        spans.append((start, end))
+    return spans
+
+
 def preprocess_frame(frame_bgr: np.ndarray, target_w: int, target_h: int) -> torch.Tensor:
     """BGR numpy frame -> (3, H, W) float [0,1] tensor."""
     rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
@@ -412,20 +448,13 @@ class IncrementalPi3:
             r = self.process_chunk()
             return [r] if r else []
 
-        # ── Determine how many chunks we can form ──
         buf_len = len(self.frame_buffer)
         was_first = self.is_first_chunk
-
-        if was_first:
-            if buf_len < self.chunk_size:
-                return []
-            max_chunks = 1 + (buf_len - self.chunk_size) // stride
-        else:
-            if buf_len < stride:
-                return []
-            max_chunks = buf_len // stride
-
-        n_chunks = min(max_chunks, self.num_workers)
+        spans = plan_chunks(buf_len, was_first, self.chunk_size, self.overlap,
+                            self.num_workers)
+        if not spans:
+            return []
+        n_chunks = len(spans)
         if n_chunks <= 1:
             r = self.process_chunk()
             return [r] if r else []
@@ -439,24 +468,14 @@ class IncrementalPi3:
         # ── Build chunk frame lists ──
         chunk_frame_lists: list[list[torch.Tensor]] = []
 
-        for ci in range(n_chunks):
-            if was_first:
-                # All chunks are independent
-                start = ci * stride
-                end = start + self.chunk_size
-                frames = list(self.frame_buffer[start:end])
+        for start, end in spans:
+            if start < 0:
+                # carried over from the previous chunk's tail
+                frames = [self._prev_overlap_imgs[i]
+                          for i in range(self._prev_overlap_imgs.shape[0])]
+                frames += list(self.frame_buffer[:end])
             else:
-                if ci == 0:
-                    # First chunk uses overlap from previous session
-                    overlap_imgs = [self._prev_overlap_imgs[i]
-                                    for i in range(self._prev_overlap_imgs.shape[0])]
-                    new_frames = list(self.frame_buffer[:stride])
-                    frames = overlap_imgs + new_frames
-                else:
-                    # Independent chunk (no prior injection)
-                    start = ci * stride - self.overlap
-                    end = start + self.chunk_size
-                    frames = list(self.frame_buffer[start:end])
+                frames = list(self.frame_buffer[start:end])
 
             if len(frames) < self.chunk_size:
                 break
