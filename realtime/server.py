@@ -768,11 +768,20 @@ async def label_objects_endpoint(req: LabelRequest):
     if _labeling_in_progress:
         return JSONResponse({"error": "Labeling already in progress"}, status_code=409)
 
+    # Claim the slot here rather than inside the worker. Handlers run on the
+    # single event-loop thread, so this check-and-set cannot be interleaved;
+    # setting it after the thread starts left a window in which a second
+    # request also passed the guard and loaded a second SAM3 onto a GPU that
+    # auto_detect_workers has already sized to be full.
+    _labeling_in_progress = True
+
     # Notify viewers that labeling is starting
     await broadcast_to_viewers({'type': 'labeling_start', 'prompts': prompts})
 
-    # Capture the event loop for broadcasting from the background thread
-    loop = asyncio.get_event_loop()
+    # Capture the event loop for broadcasting from the background thread.
+    # get_running_loop, not get_event_loop: inside a coroutine the latter is
+    # deprecated and only happens to work.
+    loop = asyncio.get_running_loop()
 
     # Copy frame_data snapshot so background thread doesn't fight with pipeline
     frame_data_snapshot = list(pipeline.frame_data)
@@ -780,7 +789,6 @@ async def label_objects_endpoint(req: LabelRequest):
     def _run_labeling_background():
         """Runs in a daemon thread. Broadcasts results via WebSocket when done."""
         global object_labeler, _labeling_in_progress
-        _labeling_in_progress = True
 
         try:
             if object_labeler is None:
@@ -846,9 +854,15 @@ async def label_objects_endpoint(req: LabelRequest):
         finally:
             _labeling_in_progress = False
 
-    # Fire-and-forget: start background thread, return 202 immediately
-    t = threading.Thread(target=_run_labeling_background, daemon=True)
-    t.start()
+    # Fire-and-forget: start background thread, return 202 immediately.
+    # If the thread cannot start, release the slot we claimed above, otherwise
+    # labeling is wedged at "already in progress" until the server restarts.
+    try:
+        t = threading.Thread(target=_run_labeling_background, daemon=True)
+        t.start()
+    except BaseException:
+        _labeling_in_progress = False
+        raise
 
     return JSONResponse(
         {"status": "labeling_started", "prompts": prompts, "max_frames": max_frames},
@@ -1008,7 +1022,10 @@ async def _close_openai():
 
 @app.on_event("startup")
 async def startup():
-    loop = asyncio.get_event_loop()
+    # The worker thread hands broadcasts back with run_coroutine_threadsafe, so
+    # it needs the loop that is actually running, not whatever get_event_loop
+    # would resolve to.
+    loop = asyncio.get_running_loop()
     t = threading.Thread(target=processing_loop, args=(loop,), daemon=True)
     t.start()
     print("[Server] Background processing thread started")
