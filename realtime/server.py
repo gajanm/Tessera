@@ -138,6 +138,30 @@ def _locked_save() -> None:
         pipeline.save_to_disk()
 
 
+def _decode_frame(img_b64: str):
+    """base64 JPEG -> BGR ndarray. Blocking (CPU), call via to_thread."""
+    img_bytes = base64.b64decode(img_b64)
+    img_arr = np.frombuffer(img_bytes, dtype=np.uint8)
+    return cv2.imdecode(img_arr, cv2.IMREAD_COLOR)
+
+
+def _encode_current_cloud():
+    """Snapshot and encode the accumulated cloud, or None if empty.
+
+    Concatenating millions of points and packing them is blocking CPU work,
+    so this runs via to_thread rather than inside the WebSocket handler.
+    """
+    if pipeline is None or pipeline.total_points <= 0:
+        return None
+    cloud = pipeline.get_global_cloud(max_points=100_000)
+    return encode_point_cloud_binary_fast(
+        cloud['points'], cloud['colors'],
+        max(pipeline.chunks_processed - 1, 0),
+        pipeline.total_points,
+        0.0,
+    )
+
+
 def _wipe_saved_state() -> None:
     """Delete the persisted cloud/frames. Blocking (filesystem)."""
     base_dir = os.path.dirname(__file__)
@@ -521,13 +545,18 @@ async def upload_video(file: UploadFile = File(...), fps: float = 2.0, fast: boo
     """Upload a video file for testing (simulates live camera feed)."""
     video_feeder_stop.clear()
 
-    # Save uploaded file
+    # Save uploaded file. Streamed in chunks rather than file.read() into one
+    # bytes object, so a large video does not spike memory, and each write goes
+    # to a worker thread so disk I/O never stalls the loop.
     tmp = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
-    content = await file.read()
-    tmp.write(content)
-    tmp.flush()
     tmp_path = tmp.name
     tmp.close()
+    with open(tmp_path, 'wb') as out:
+        while True:
+            chunk = await file.read(1 << 20)
+            if not chunk:
+                break
+            await asyncio.to_thread(out.write, chunk)
 
     # Reset pipeline
     await asyncio.to_thread(_locked_reset)
@@ -830,14 +859,8 @@ async def viewer_ws(ws: WebSocket):
     })
 
     # If we already have a cloud, send it
-    if pipeline.total_points > 0:
-        cloud = pipeline.get_global_cloud(max_points=100_000)
-        binary = encode_point_cloud_binary_fast(
-            cloud['points'], cloud['colors'],
-            pipeline.chunks_processed - 1,
-            pipeline.total_points,
-            0.0
-        )
+    binary = await asyncio.to_thread(_encode_current_cloud)
+    if binary is not None:
         await ws.send_bytes(binary)
 
     try:
@@ -866,14 +889,9 @@ async def viewer_ws(ws: WebSocket):
                 await broadcast_to_viewers({'type': 'reset'})
 
             elif msg.get('type') == 'get_cloud':
-                cloud = pipeline.get_global_cloud(max_points=100_000)
-                binary = encode_point_cloud_binary_fast(
-                    cloud['points'], cloud['colors'],
-                    pipeline.chunks_processed - 1 if pipeline.chunks_processed > 0 else 0,
-                    pipeline.total_points,
-                    0.0
-                )
-                await ws.send_bytes(binary)
+                binary = await asyncio.to_thread(_encode_current_cloud)
+                if binary is not None:
+                    await ws.send_bytes(binary)
 
     except WebSocketDisconnect:
         pass
@@ -895,10 +913,10 @@ async def sender_ws(ws: WebSocket):
             msg = json.loads(data)
 
             if msg.get('type') == 'frame':
-                img_b64 = msg['image']
-                img_bytes = base64.b64decode(img_b64)
-                img_arr = np.frombuffer(img_bytes, dtype=np.uint8)
-                frame = cv2.imdecode(img_arr, cv2.IMREAD_COLOR)
+                # base64 + JPEG decode is 5-15ms of CPU per frame; at 10fps that
+                # is a permanent tax on the event loop, stalling every other
+                # connection. Hand it to a worker thread.
+                frame = await asyncio.to_thread(_decode_frame, msg['image'])
 
                 if frame is not None:
                     frames_received += 1
