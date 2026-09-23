@@ -555,10 +555,12 @@ async def get_config():
 @app.get("/cloud")
 async def get_full_cloud():
     """Get the full accumulated point cloud (downsampled)."""
-    cloud = pipeline.get_global_cloud(max_points=200_000)
-    # Return as binary
+    # Concatenating and downsampling the whole cloud is blocking CPU work and
+    # has no business running on the event loop. Note this endpoint discards
+    # the cloud it builds and returns only counts -- left as-is here because
+    # deleting it is a separate decision, but it is an expensive no-op.
+    cloud = await asyncio.to_thread(pipeline.get_global_cloud, 200_000)
     pts = cloud['points']
-    cols = cloud['colors']
     return JSONResponse({
         "total_points": pipeline.total_points,
         "returned_points": len(pts),
