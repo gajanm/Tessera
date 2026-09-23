@@ -70,26 +70,35 @@ def frames_dropped_total_inc():
 # ─────────────────────────────────────────
 # WebSocket broadcast helper
 # ─────────────────────────────────────────
+async def _fan_out(targets: list[WebSocket], sends) -> None:
+    """Await every send concurrently and drop the sockets that failed.
+
+    Two reasons this is not a plain `for ws in connected_viewers: await ...`:
+    the await yields, so a viewer connecting or disconnecting mid-loop mutates
+    the set we are iterating and raises "Set changed size during iteration",
+    killing the broadcast partway through; and sending serially means one slow
+    viewer delays every viewer queued behind it.
+    """
+    results = await asyncio.gather(*sends, return_exceptions=True)
+    dead = {ws for ws, r in zip(targets, results) if isinstance(r, BaseException)}
+    if dead:
+        connected_viewers.difference_update(dead)
+
+
 async def broadcast_to_viewers(message: dict):
     """Send JSON message to all connected viewer WebSockets."""
-    dead = set()
-    for ws in connected_viewers:
-        try:
-            await ws.send_json(message)
-        except Exception:
-            dead.add(ws)
-    connected_viewers.difference_update(dead)
+    targets = list(connected_viewers)
+    if not targets:
+        return
+    await _fan_out(targets, [ws.send_json(message) for ws in targets])
 
 
 async def broadcast_binary(data: bytes):
     """Send binary data to all connected viewer WebSockets."""
-    dead = set()
-    for ws in connected_viewers:
-        try:
-            await ws.send_bytes(data)
-        except Exception:
-            dead.add(ws)
-    connected_viewers.difference_update(dead)
+    targets = list(connected_viewers)
+    if not targets:
+        return
+    await _fan_out(targets, [ws.send_bytes(data) for ws in targets])
 
 
 def encode_point_cloud_binary(points: np.ndarray, colors: np.ndarray, chunk_id: int, total: int, elapsed: float) -> bytes:
