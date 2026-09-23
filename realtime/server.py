@@ -101,6 +101,56 @@ async def broadcast_binary(data: bytes):
     await _fan_out(targets, [ws.send_bytes(data) for ws in targets])
 
 
+# ─────────────────────────────────────────
+# Blocking pipeline operations
+#
+# Every one of these takes `processing_lock`, which the worker thread holds for
+# the whole duration of a chunk. Acquiring it directly inside an `async def`
+# parks the event loop thread, so a single /configure or /reset froze frame
+# ingest, chunk broadcasts, acks and /health for seconds. Handlers call these
+# through asyncio.to_thread so the wait happens on a worker thread and the loop
+# keeps serving.
+# ─────────────────────────────────────────
+def _drain_frame_queue() -> None:
+    while not frame_queue.empty():
+        try:
+            frame_queue.get_nowait()
+        except queue.Empty:
+            break
+
+
+def _locked_reset() -> None:
+    """Drain queued frames and reset the pipeline. Blocking."""
+    with processing_lock:
+        _drain_frame_queue()
+        pipeline.reset()
+
+
+def _locked_configure(**kwargs) -> None:
+    """Hot-reconfigure the pipeline. Blocking."""
+    with processing_lock:
+        pipeline.configure(**kwargs)
+
+
+def _locked_save() -> None:
+    """Persist cloud and frames to disk. Blocking."""
+    with processing_lock:
+        pipeline.save_to_disk()
+
+
+def _wipe_saved_state() -> None:
+    """Delete the persisted cloud/frames. Blocking (filesystem)."""
+    base_dir = os.path.dirname(__file__)
+    for fname in ['saved_cloud.npz', 'saved_frames.npz']:
+        fpath = os.path.join(base_dir, fname)
+        if os.path.exists(fpath):
+            try:
+                os.remove(fpath)
+                print(f"[Server] Deleted {fname}")
+            except Exception:
+                pass
+
+
 def encode_point_cloud_binary(points: np.ndarray, colors: np.ndarray, chunk_id: int, total: int, elapsed: float) -> bytes:
     """
     Encode point cloud as binary for efficient transfer.
@@ -404,8 +454,7 @@ async def save_state():
         })
 
     try:
-        with processing_lock:
-            pipeline.save_to_disk()
+        await asyncio.to_thread(_locked_save)
         return {
             "status": "saved",
             "total_points": pipeline.total_points,
@@ -419,25 +468,8 @@ async def save_state():
 @app.post("/reset")
 async def reset():
     """Reset pipeline state and wipe saved frames/cloud from disk."""
-    with processing_lock:
-        # Drain frame queue  
-        while not frame_queue.empty():
-            try:
-                frame_queue.get_nowait()
-            except queue.Empty:
-                break
-        pipeline.reset()
-
-    # Wipe persisted files
-    base_dir = os.path.dirname(__file__)
-    for fname in ['saved_cloud.npz', 'saved_frames.npz']:
-        fpath = os.path.join(base_dir, fname)
-        if os.path.exists(fpath):
-            try:
-                os.remove(fpath)
-                print(f"[Server] Deleted {fname}")
-            except Exception:
-                pass
+    await asyncio.to_thread(_locked_reset)
+    await asyncio.to_thread(_wipe_saved_state)
 
     await broadcast_to_viewers({'type': 'reset'})
     return {"status": "reset_complete"}
@@ -446,12 +478,12 @@ async def reset():
 @app.post("/configure")
 async def configure(config: dict):
     """Hot-reconfigure pipeline parameters."""
-    with processing_lock:
-        pipeline.configure(
-            chunk_size=config.get('chunk_size'),
-            overlap=config.get('overlap'),
-            conf_thre=config.get('conf_thre'),
-        )
+    await asyncio.to_thread(
+        _locked_configure,
+        chunk_size=config.get('chunk_size'),
+        overlap=config.get('overlap'),
+        conf_thre=config.get('conf_thre'),
+    )
     return {
         "status": "configured",
         "chunk_size": pipeline.chunk_size,
@@ -498,13 +530,7 @@ async def upload_video(file: UploadFile = File(...), fps: float = 2.0, fast: boo
     tmp.close()
 
     # Reset pipeline
-    with processing_lock:
-        while not frame_queue.empty():
-            try:
-                frame_queue.get_nowait()
-            except queue.Empty:
-                break
-        pipeline.reset()
+    await asyncio.to_thread(_locked_reset)
 
     await broadcast_to_viewers({'type': 'reset'})
 
@@ -820,12 +846,12 @@ async def viewer_ws(ws: WebSocket):
             msg = json.loads(data)
 
             if msg.get('type') == 'configure':
-                with processing_lock:
-                    pipeline.configure(
-                        chunk_size=msg.get('chunk_size'),
-                        overlap=msg.get('overlap'),
-                        conf_thre=msg.get('conf_thre'),
-                    )
+                await asyncio.to_thread(
+                    _locked_configure,
+                    chunk_size=msg.get('chunk_size'),
+                    overlap=msg.get('overlap'),
+                    conf_thre=msg.get('conf_thre'),
+                )
                 await ws.send_json({
                     'type': 'configured',
                     'config': {
@@ -835,23 +861,8 @@ async def viewer_ws(ws: WebSocket):
                     }
                 })
             elif msg.get('type') == 'reset':
-                with processing_lock:
-                    while not frame_queue.empty():
-                        try:
-                            frame_queue.get_nowait()
-                        except queue.Empty:
-                            break
-                    pipeline.reset()
-                # Wipe persisted files
-                base_dir = os.path.dirname(__file__)
-                for fname in ['saved_cloud.npz', 'saved_frames.npz']:
-                    fpath = os.path.join(base_dir, fname)
-                    if os.path.exists(fpath):
-                        try:
-                            os.remove(fpath)
-                            print(f"[Server] Deleted {fname}")
-                        except Exception:
-                            pass
+                await asyncio.to_thread(_locked_reset)
+                await asyncio.to_thread(_wipe_saved_state)
                 await broadcast_to_viewers({'type': 'reset'})
 
             elif msg.get('type') == 'get_cloud':
